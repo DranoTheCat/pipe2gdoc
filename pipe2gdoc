@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+
+import yaml
+import argparse
+import pickle
+import time
+import os.path
+import sys
+import datetime
+import unicodedata
+import signal
+import re
+from pathlib import Path
+from select import select
+from googleapiclient.discovery import build
+from google_auth_oauthlib.flow import InstalledAppFlow
+from google.auth.transport.requests import Request
+
+class GDocPipe:
+  def __init__(self, documentId, pickleToken, authenticate, credentials):
+    self.newline_escape = re.compile(r'\n')
+    self.newline_unscape = re.compile(r':NEWLINE:')
+    self.ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
+    # If modifying these scopes, delete the file token.pickle.
+    self.SCOPES = ['https://www.googleapis.com/auth/documents']
+    self.documentId = documentId 
+    self.connect(pickleToken, authenticate, credentials)
+
+  def connect(self, pickleToken, authenticate, credentials):
+    creds = None
+    if authenticate:
+      if not creds or not creds.valid:
+        if creds and creds.expired and creds.refresh_token:
+          print("Credentials not provided, or have expired.")
+        else:
+          flow = InstalledAppFlow.from_client_secrets_file(
+              credentials, self.SCOPES)
+          creds = flow.run_local_server()
+          with open(pickleToken, 'wb') as token:
+              pickle.dump(creds, token)
+      sys.exit(0)
+    else:
+      if os.path.exists(pickleToken):
+        with open(pickleToken, 'rb') as token:
+          creds = pickle.load(token)
+    self.service = build('docs', 'v1', credentials=creds)
+
+  def cleanupString(self, txt):
+    newstr = self.ansi_escape.sub('', txt)
+    newstr2= self.newline_escape.sub(':NEWLINE:', newstr)
+    newstr3 = "".join(ch for ch in newstr2 if unicodedata.category(ch)[0]!="C")
+    fstr = self.newline_unscape.sub("\n", newstr3)
+    return fstr
+
+  def createdoc(self):
+    now = str(datetime.datetime.now())
+    title = "pipe2gdoc_{}".format(now)
+    body = { 'title': title }
+    doc = self.service.documents().create(body=body).execute()
+    return doc
+
+  def addText(self, txt):
+    if self.documentId == 'new':
+      document = self.createdoc()
+      self.documentId = document.get('documentId')
+    else:
+      document = self.service.documents().get(documentId=self.documentId).execute()
+    txt = self.cleanupString(txt)
+    startIndex = document['body']['content'][1]['startIndex']
+    endIndex = document['body']['content'][len(document['body']['content'])-1]['endIndex']
+    requests = []
+    requests.append( { 'insertText': { 'location': { 'index': endIndex-1, }, 'text': txt } }, )
+    requests.append( { 'updateTextStyle': { 'range': { 'startIndex': startIndex, 'endIndex': endIndex + len(txt) }, 'textStyle': { 'weightedFontFamily': { 'fontFamily': 'Courier New' } }, 'fields': 'weightedFontFamily' } }, )
+    result = self.service.documents().batchUpdate(
+        documentId=self.documentId, body={'requests': requests}
+    ).execute()
+
+def get_args():
+  parser = argparse.ArgumentParser(description="Send the output of console commands to a Google Doc", formatter_class=argparse.RawTextHelpFormatter)
+  parser.add_argument("-q", required=False, default=False, action="store_true",
+      help="Suppress all standard output.\n" )
+  parser.add_argument("--documentId", required=False, type=str, default="null",
+      help="The Google Document ID.  Use 'new' if you want to create a new document.\n"
+           "  The new document would be named similar to pipe2gdoc_2020-02-08 02:12:31.278968\n"
+           "  Example:  --documentId 1W8vd1Ad0LJt5FIWQOzaIUhOby4dwhL9TPkihFhb0dOU\n" 
+           "  Example:  --documentId new\n" )
+  parser.add_argument("--maxBuffer", required=False, type=int, default=1000,
+      help="The maximum number of lines to buffer locally before commiting the current buffer to the GDoc.  The default is 1000.\n"
+           "  Example:  --maxBuffer 500\n" )
+  parser.add_argument("--maxTime", required=False, type=int, default=30,
+      help="The maximum time in seconds to wait for new input (while below the buffer max) before commiting the current buffer to the GDoc.  The default is 30.\n"
+           "  Example:  --maxTime 10\n" )
+  parser.add_argument("--config", required=False, type=str, default="{}/.pipe2gdocrc".format(Path.home()),
+      help="The location of your YAML configuration file.  Defaults to ~/.pipe2gdocrc\n"
+           "  Example:  --config /opt/oddworld/mypipe2gdocrc\n" )
+  parser.add_argument("--pickleToken", required=False, default='token.pickle', type=str,
+      help="The path to your token.pickle file.  It defaults to ./token.pickle\n"
+           "  Example:  --pickleToken /opt/oddworld/token.pickle\n" )
+  parser.add_argument("--authenticate", required=False, default=False, action="store_true",
+      help="Authenticate with OAuth, using the credentials provided in either ./credentials.json, or the file you provide with --credentials.\n"
+           "  Example:  --authenticate --credentials /opt/oddworld/credentials.json --tokenPickle /opt/oddworld/token.pickle\n" )
+  parser.add_argument("--credentials", required=False, default='credentials.json', type=str,
+      help="If --pickleToken is specified, then the token will be written to the path provided.  Otherwise, it will bre written to ./token.pickle\n"
+           "If your pickle token is already created, you do not need this option.\n"
+           "  Example:  --authenticate --credentials /opt/oddworld/credentials.json --tokenPickle /opt/oddworld/token.pickle\n" )
+  args = parser.parse_args()
+  return args
+
+def load_config(args):
+  if os.path.exists(args.config):
+    try:
+      with open(args.config) as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)     
+    except IOError as e:
+      print("File {} not accessible: {}".format(args.config, e))
+      sys.exit(1)
+    if 'documentId' in config.keys() and args.documentId == 'null':
+      args.documentId = config['documentId']
+    if 'maxBuffer' in config.keys():
+      args.maxBuffer = config['maxBuffer']
+    if 'maxTime' in config.keys():
+      args.maxTime = config['maxTime']
+    if 'pickleToken' in config.keys():
+      args.pickleToken = config['pickleToken']
+    if 'credentials' in config.keys():
+      args.credentials = config['credentials']
+  return args
+
+if __name__ == '__main__':
+  args = get_args()
+  args = load_config(args)
+  if not args.authenticate and args.documentId == 'null':
+    print("--documentId is required.")
+    sys.exit(1)
+  doc = GDocPipe(args.documentId, args.pickleToken, args.authenticate, args.credentials)
+  buf = []
+  st = int(time.time())
+  while True:
+    ir, _, e = select([sys.stdin], [], [sys.stdin], args.maxTime)
+    if ir:
+      try:
+        line = input()
+        if len(line) > 0:
+          buf.append("{}\n".format(line))
+        else:
+          continue
+      except EOFError:
+        if not args.q:
+          print("Flushing buffer.")
+        buf.append("\n")
+        doc.addText("".join(buf))
+        break
+    if len(buf) > args.maxBuffer or (int(time.time()) - st >= args.maxTime and len(buf) > 0):
+      if not args.q:
+         print("Flushing buffer.")
+      doc.addText("".join(buf))
+      st = int(time.time())
+      buf = []
